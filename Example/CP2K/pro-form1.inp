@@ -1,0 +1,151 @@
+@SET SYSNAME                 pro-form1
+@SET RESTART                 .TRUE.
+@SET RESTART_FILE            pro-form1-1.restart
+@SET RESTART_THERMOSTAT      .TRUE.  # Restart from external file
+@SET RESTART_BAROSTAT        .TRUE.  # Restart from external file
+@SET RESTART_CELL            .TRUE.  # Restart from external file
+@SET RESTART_AVERAGES        .TRUE.  # Restart from external file ?
+@SET MD_STEPS                64000
+@SET MD_ENS                  NVT
+@SET MD_REGION               GLOBAL
+@SET MD_T_TIMECONSTANT       100.0
+@SET MD_P_TIMECONSTANT       100.0
+@SET MD_DT                   0.5
+@SET MD_TEMP                 300
+@SET MD_PRESSURE             1.0
+@SET SCF_GUESS               ATOMIC
+@IF ( ${RESTART} == TRUE )
+    @SET SCF_GUESS           RESTART
+@ENDIF
+
+&GLOBAL
+  PROJECT ${SYSNAME}
+  RUN_TYPE MD
+  PRINT_LEVEL LOW
+  FFTW_PLAN_TYPE EXHAUSTIVE
+  FFTW_WISDOM_FILE_NAME wisdom.dat
+  ! EXTENDED_FFT_LENGTHS
+&END GLOBAL
+
+&FORCE_EVAL
+  METHOD QS
+  &DFT
+    BASIS_SET_FILE_NAME  BASIS_MOLOPT
+    POTENTIAL_FILE_NAME  POTENTIAL
+    &MGRID
+      NGRIDS 4
+      CUTOFF 450
+      REL_CUTOFF 50
+    &END MGRID
+    &QS
+      EPS_DEFAULT 1.0E-12
+      WF_INTERPOLATION PS
+      EXTRAPOLATION_ORDER 3
+    &END QS
+    &SCF
+      SCF_GUESS ${SCF_GUESS}
+      MAX_SCF 15
+      &OT ON
+        PRECONDITIONER FULL_KINETIC
+        MINIMIZER DIIS
+      &END OT
+      &OUTER_SCF
+         MAX_SCF 20
+         EPS_SCF 1.0E-6
+      &END OUTER_SCF
+      EPS_SCF 1.0E-6
+      &PRINT
+        &RESTART
+           &EACH
+              MD 0
+           &END EACH
+        &END RESTART
+      &END PRINT
+    &END SCF
+    &XC
+      &XC_FUNCTIONAL PBE
+      &END XC_FUNCTIONAL
+      &XC_GRID
+         XC_DERIV NN10_SMOOTH
+         XC_SMOOTH_RHO NN10
+      &END XC_GRID
+      &vdW_POTENTIAL
+       &PAIR_POTENTIAL
+         TYPE DFTD3
+         PARAMETER_FILE_NAME dftd3.dat
+         REFERENCE_FUNCTIONAL PBE
+         # CALCULATE_C9_TERM .TRUE.
+       &END PAIR_POTENTIAL
+      &END vdW_POTENTIAL
+    &END XC
+    &PRINT
+      &E_DENSITY_BQB ON
+        &EACH
+          MD 8
+        &END EACH
+        ADD_LAST NUMERIC
+        FILENAME = density_ir.bqb
+        ! SKIP_FIRST
+        STORE_STEP_NUMBER
+      &END
+      &MOMENTS
+        PERIODIC
+        FILENAME = dipolemoments.traj
+        ADD_LAST NUMERIC
+        &EACH
+          MD 1
+        &END EACH
+       &END MOMENTS
+    &END PRINT
+  &END DFT
+  @INCLUDE 'subsys.inc'
+&END FORCE_EVAL
+&MOTION
+   &MD
+      ENSEMBLE ${MD_ENS}
+      STEPS ${MD_STEPS}
+      TIMESTEP ${MD_DT}
+      TEMPERATURE ${MD_TEMP}
+      @IF ( ${MD_ENS} == NPT_F )
+          &BAROSTAT
+             &THERMOSTAT 
+                TYPE CSVR
+                &CSVR
+                   TIMECON ${MD_T_TIMECONSTANT}     # 100 for production
+                &END CSVR
+             &END THERMOSTAT
+             PRESSURE ${MD_PRESSURE}    # Units in bar
+             TIMECON ${MD_P_TIMECONSTANT}     # 100 for production
+          &END BAROSTAT
+      @ENDIF
+      &THERMOSTAT
+         TYPE CSVR
+         REGION ${MD_REGION}
+         &CSVR
+            TIMECON ${MD_T_TIMECONSTANT}     # 100 for production
+         &END CSVR
+      &END THERMOSTAT
+   &END MD
+   &PRINT
+      &RESTART
+         BACKUP_COPIES 0
+         &EACH
+            MD 1
+         &END EACH
+      &END RESTART
+      &RESTART_HISTORY
+         &EACH
+            MD 0
+         &END EACH
+      &END RESTART_HISTORY
+   &END PRINT
+&END MOTION
+@IF ( ${RESTART} == .TRUE. )
+    &EXT_RESTART
+       EXTERNAL_FILE ${RESTART_FILE}
+       RESTART_BAROSTAT   ${RESTART_BAROSTAT}
+       RESTART_THERMOSTAT ${RESTART_THERMOSTAT}
+       RESTART_AVERAGES   ${RESTART_AVERAGES}
+       RESTART_CELL   ${RESTART_CELL}
+    &END EXT_RESTART
+@ENDIF

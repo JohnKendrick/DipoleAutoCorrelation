@@ -1,0 +1,766 @@
+#!/usr/bin/env python
+#
+#  Compute the dipole correlation functions
+#
+import sys
+import math
+import numpy as np
+import scipy.signal as signal
+import xlsxwriter as xlsx
+from scipy.ndimage import uniform_filter1d
+from random import uniform
+import cmath
+#from memspectrum import MESA
+
+def find_next_power_of_two(m):
+    """ Find the first power of two that greater than m """
+    exp = math.floor(np.log2(m))
+    n = np.power(2,exp)
+    if n < m:
+        n *= 2
+    return n
+
+def derivatives(dipoles,dt):
+    derivatives = np.gradient(dipoles, edge_order=2)
+    return derivatives / dt
+
+def print_usage():
+    print('dipole_acf: filename -blocksize size -plot [option] -print -test -window window -baseline -average -fmin f -fmax f -tmin t -tmax t',file=sys.stderr)
+    print('-blocksize  size   No blocking is performed unless a non-zero block size is given', file=sys.stderr)
+    print('-blockshift shift  By default blockshift is blocksize', file=sys.stderr)
+    print('                   A factor of 2 means two blocks of zeros are used     ', file=sys.stderr)
+    print('-plot [option]     Plotting is on by default unless printing is required', file=sys.stderr)
+    print('                   option can be the strings dipole, correlations or absorption', file = sys.stderr)
+    print('-xlsx file         An xlsx file is written ', file=sys.stderr)
+    print('-test              A test calculation use a cos function of 1500, 1000 and 500 cm-1', file=sys.stderr)
+    print('                   If given the filename is not used', file=sys.stderr)
+    print('-window  window  ', file=sys.stderr)
+    print('                   window can be \'tukey\'', file=sys.stderr)
+    print('                                 \'bartlett\'', file=sys.stderr)
+    print('                                 \'blackman\'', file=sys.stderr)
+    print('                                 \'flattop\'', file=sys.stderr)
+    print('                                 \'hann\'', file=sys.stderr)
+    print('                                 \'nuttall\'', file=sys.stderr)
+    print('                                 \'exp\' a epsilon', file=sys.stderr)
+    print('                                 a are the number of steps before applying the exponential', file=sys.stderr)
+    print('                                 epsilon is the exponent of the decay', file=sys.stderr)
+    print('-baseline          A crude baseline removal', file=sys.stderr)
+    print('-notimederivatives Disable the use of time derivatives in fphi', file=sys.stderr)
+    print('-correlationlength Set the correlation length                 ', file=sys.stderr)
+    print('-average l         Perform moving average with length l', file=sys.stderr)
+    print('-fmin  frequency   Plot from a given frequency           ', file=sys.stderr)
+    print('-fmax  frequency   Plot up to given frequency           ', file=sys.stderr)
+    print('-tmin  t           Plot from a given time           ', file=sys.stderr)
+    print('-tmax  t           Plot up to given time           ', file=sys.stderr)
+    print('Description of file',file=sys.stderr)
+    print('-------------------',file=sys.stderr)
+    print('The first line specifies;',file=sys.stderr)
+    print('   time_step volume temperature number_of_molecules',file=sys.stderr)
+    print('Subsequent line store the dipole moments at each time step;',file=sys.stderr)
+    print('   Mx My Mz',file=sys.stderr)
+    return
+
+def get_window(windowfunction,windowsize,exponential):
+    #
+    # Compute the window
+    #
+    if windowfunction == 'tukey':
+        window = signal.tukey(2*windowsize)[windowsize:]
+    elif windowfunction == 'bartlett':
+        window = signal.bartlett(2*windowsize)[windowsize:]
+    elif windowfunction == 'blackman':
+        window = signal.blackman(2*windowsize)[windowsize:]
+    elif windowfunction == 'flattop':
+        window = signal.flattop(2*windowsize)[windowsize:]
+    elif windowfunction == 'hann':
+        window = signal.hann(2*windowsize)[windowsize:]
+    elif windowfunction == 'nuttall':
+        window = signal.nuttall(2*windowsize)[windowsize:]
+    elif windowfunction == 'exp':
+        # This function is described in Masoori and Greenfield (equation 4)
+        a = exponential['a']
+        b = windowsize
+        if a >= b:
+            a = 2 * windowsize / 3
+        epsilon = exponential['epsilon']
+        window = np.zeros(b)
+        window[:a] = np.ones(a)
+        window[a:] = [ np.exp(-epsilon*(x-a)/(b-a)) for x in np.arange(a,b) ]
+    return window
+
+def write_preliminary_xlsx_info():
+    global filename
+    global number_of_molecules
+    global optical_permittivity
+    global ntotal
+    global temperature, volume, concentration
+    global time_step
+    global nyquist_frequency_cm1, frequency_step_cm1
+    global f_min, fmax
+    global use_blocking, blocksize, blockshift, nblocks
+    global correlation_length, padding_factor
+    global windowfunction, use_window
+    global average_length
+    global xlsxfile
+    #
+    # Write out the information to the xlsx file
+    #
+    workbook = xlsx.Workbook(xlsxfile)
+    worksheet = workbook.add_worksheet('Information')
+    row = 0
+    col = 0
+    o = optical_permittivity
+    row,col = write_row( worksheet, row, col, ['File name',filename])
+    row,col = write_row( worksheet, row, col, ['Time step',time_step, 'fs'])
+    row,col = write_row( worksheet, row, col, ['Nyquist frequency',nyquist_frequency_cm1, 'cm-1'])
+    row,col = write_row( worksheet, row, col, ['Frequency step',frequency_step_cm1, 'cm-1'])
+    row,col = write_row( worksheet, row, col, ['Temperature',temperature, 'K'])
+    row,col = write_row( worksheet, row, col, ['Volume of cell',volume, 'angstrom^3'])
+    row,col = write_row( worksheet, row, col, ['Number of molecules / cell',number_of_molecules])
+    row,col = write_row( worksheet, row, col, ['Concentration',concentration, 'moles/L'])
+    row,col = write_row( worksheet, row, col, ['Optical permittivity',o[0,0],o[0,1],o[0,2]])
+    row,col = write_row( worksheet, row, col, ['                    ',o[1,0],o[1,1],o[1,2]])
+    row,col = write_row( worksheet, row, col, ['                    ',o[2,0],o[2,1],o[2,2]])
+    row,col = write_row( worksheet, row, col, ['Trajectory length',ntotal])
+    row,col = write_row( worksheet, row, col, ['Minimum frequency',f_min])
+    row,col = write_row( worksheet, row, col, ['Maximum frequency',f_max])
+    if use_blocking:
+        row,col = write_row( worksheet, row, col, ['Using blocking with a blocksize',blocksize])
+        row,col = write_row( worksheet, row, col, ['                     blockshift',blockshift])
+    else:
+        row,col = write_row( worksheet, row, col, ['Not using blocking, fft length',blocksize])
+    row,col = write_row( worksheet, row, col, ['Block time period',blocksize*time_step, 'fs'])
+    row,col = write_row( worksheet, row, col, ['Block shift time period',blockshift*time_step, 'fs'])
+    row,col = write_row( worksheet, row, col, ['Block nyquist frequency',block_nyquist_frequency_cm1, 'cm-1'])
+    row,col = write_row( worksheet, row, col, ['Number of blocks',nblocks])
+    row,col = write_row( worksheet, row, col, ['Correlation length',correlation_length])
+    row,col = write_row( worksheet, row, col, ['Padding factor',padding_factor])
+    if average_length > 0:
+        row,col = write_row( worksheet, row, col, ['Perform a moving average',average_length])
+    if use_windowing:
+        row,col = write_row( worksheet, row, col, ['Applying window function',windowfunction])
+        if windowfunction == 'exp':
+            row,col = write_row( worksheet, row, col, ['                       a',exponential['a']])
+            row,col = write_row( worksheet, row, col, ['                     exp',exponential['epsilon']])
+    else:
+        row,col = write_row( worksheet, row, col, ['No windowing'])
+    row,col = write_row( worksheet, row, col, ['Writing an xlsx file',xlsxfile])
+    return workbook
+
+def test_dipoles():
+    #
+    # Create test dipole sequence
+    #
+    global number_of_molecules
+    global volume
+    global temperature
+    global time_step
+    number_of_molecules = 1
+    volume = 100
+    temperature = 300
+    time_step = 0.5                               # in fs
+    fx_cm1 = 1500                                 # in cm-1
+    fy_cm1 = 1000
+    fz_cm1 = 500
+    fx_fs  = fx_cm1 * speed_of_light_cms / 1.0E15 # in fs-1
+    fy_fs  = fy_cm1 * speed_of_light_cms / 1.0E15
+    fz_fs  = fz_cm1 * speed_of_light_cms / 1.0E15
+    #
+    test_size = 64000
+    dipoles = np.zeros( (3, test_size) )
+    t = 0
+    for step in range(test_size):
+        dipoles[0,step] =  2.0 + uniform(-0.0000001,+0.0000001)+np.sin( 2 * np.pi * fx_fs * t)
+        dipoles[1,step] = -2.0 + uniform(-0.0000001,+0.0000001)+np.cos( 2 * np.pi * fy_fs * t)
+        dipoles[2,step] =  0.0 + uniform(-0.0000001,+0.0000001)+np.cos( 2 * np.pi * fz_fs * t)
+        t = t + time_step
+    return dipoles
+
+def read_dipoles():
+    global number_of_molecules
+    global volume
+    global temperature
+    global time_step
+    global optical_permittivity
+    #
+    # Open the file containing the dipole moments
+    #
+    if filename == '':
+        print('Error no filename was given',file=sys.stderr)
+        print_usage()
+        exit()
+    with open(filename,'r') as fd:
+        try:
+            line = fd.readline().split()
+            time_step = float(line[0])
+            volume = float(line[1])
+            temperature = float(line[2])
+            number_of_molecules = float(line[3])
+            optical_permittivity = np.zeros( (3,3) )
+            k = 3
+            for i in range(3):
+               for j in range(3):
+                   k += 1
+                   optical_permittivity[i,j] = float( line[k] )
+        except:
+            print('There has been an error reading the first line of the dipole moments file')
+            print('The first line should specify the following on one line')
+            print('  time_step           (fs)')
+            print('  volume              (angstrom^3)')
+            print('  temerature          (K)')
+            print('  number_of_molecules (/cell)')
+            print('  Optical permittivity (9 values)')
+            print('Following this line are the dipole moments x,y,z and total in columns 1, 3, 5, 7')
+            exit()
+        dipoles = np.loadtxt(fd, dtype=np.float64, usecols=(1,3,5,7))
+        dipoles = dipoles.T
+    # end with
+    return dipoles
+
+def hodrick_prescott_filter(y,damping,lambda_value,niters):
+    #
+    # Apply a Hodrick Prescott filter to the spectrum in x, y
+    # y is the experimental absorption
+    # damping is used to damp the iterations
+    # lambda_value is the chosen smoothing factor
+    # Based on ideas in the thesis of Mayank Kaushik (University Adelaide)
+    #
+    from scipy import sparse
+    #
+    # Create a sparse 3rd order difference operator
+    #
+    n = len(y)
+    diag = np.ones(n-3)
+    D = sparse.spdiags( [-1*diag, 3*diag, -3*diag, 1*diag],
+                        [0, -1, -2, -3], n, n-3 ).tocsc()
+    w = np.ones(n)
+    for it in range(10*niters):
+        W = sparse.spdiags(w, 0, n, n).tocsc()
+        # Problems with overflow if lambda is large
+        try:
+            Z = W + pow(10,lambda_value) * (D.dot(D.transpose()))
+        except:
+            pass
+        z = sparse.linalg.spsolve(Z, w*y)
+        # residuals = y - z
+        # error = sum( r*r for r in residuals if r < 0.0 )
+        # error = math.sqrt(error/n)
+        w = damping*(y>z) + (1-damping)*(y<z)
+        # print(it, error)
+    return y-z
+
+
+def print_array(array):
+    """Print out an 2-D array"""
+    for row in array:
+        for val in row:
+            print('{:6}'.format(val),end=',')
+        print()
+    return
+
+def write_row(worksheet, row, col, array ):
+    """Write out a row of items in array to the worksheet, starting at row,col
+       Return the starting point for the next row"""
+    old_col = col
+    for item in array:
+        worksheet.write(row, col, item)
+        col += 1
+    return row+1, old_col
+
+def write_correlations(worksheet, correlations, times):
+   """Write out the correlations to a worksheet"""
+   col = 0
+   row = 0
+   row,col = write_row( worksheet, row, col, ['time(fs)', 'corr_xx', 'corr_yy' , 'corr_zz'] )
+   for i,t in enumerate(times):
+       row,col = write_row( worksheet, row, col, [t, correlations[0,0,i], correlations[1,1,i], correlations[2,2,i] ] )
+
+def write_absorption(worksheet, molar_absorption, absorption, permittivity, frequencies):
+   """Write out the absorption and permittivities to a worksheet"""
+   col = 0
+   row = 0
+   row,col = write_row( worksheet, row, col, [ 'f(cm1)',
+           'absorption(cm-1)',
+           'molar_absorption(L/cm/mol)',
+           'exx.real',
+           'exx.imag',
+           'eyy.real',
+           'eyy.imag',
+           'ezz.real',
+           'ezz.imag',
+           'exy.real',
+           'exy.imag',
+           'exz.real',
+           'exz.imag',
+           'eyz.real',
+           'eyz.imag'] )
+   for i,f in enumerate(frequencies):
+       if f >= f_min and f <= f_max:
+           row,col = write_row( worksheet, row, col, [f,
+               absorption[i],
+               molar_absorption[i],
+               permittivity[0,0,i].real,
+               permittivity[0,0,i].imag,
+               permittivity[1,1,i].real,
+               permittivity[1,1,i].imag,
+               permittivity[2,2,i].real,
+               permittivity[2,2,i].imag,
+               permittivity[0,1,i].real,
+               permittivity[0,1,i].imag,
+               permittivity[0,2,i].real,
+               permittivity[0,2,i].imag,
+               permittivity[1,2,i].real,
+               permittivity[1,2,i].imag])
+
+
+def plot_correlations(dipoles, times_dipoles, correlations, times_correlations):
+   import matplotlib.pyplot as plt
+   figure, axis = plt.subplots(2,1)
+   axis[0].plot(times_dipoles, dipoles[0], label='xx')
+   axis[0].plot(times_dipoles, dipoles[1], label='yy')
+   axis[0].plot(times_dipoles, dipoles[2], label='zz')
+   axis[0].set_xlabel('Time (fs)')
+   axis[0].set_ylabel('Dipole')
+   axis[0].legend()
+
+   axis[1].plot(times_correlations, correlations[0,0], label='xx')
+   axis[1].plot(times_correlations, correlations[1,1], label='yy')
+   axis[1].plot(times_correlations, correlations[2,2], label='zz')
+   axis[1].set_xlabel('Time (fs)')
+   axis[1].set_ylabel('Correlations')
+   axis[1].legend()
+
+   plt.show()
+
+
+def plot_permittivity(molar_absorption, absorption, permittivity, frequencies):
+   import matplotlib.pyplot as plt
+   figure, axis = plt.subplots(3,1)
+   #
+   #For plotting purposes only plot up to f_min to f_max
+   #
+   min_index = 0
+   for i,f in enumerate(frequencies_cm1):
+       if min_index == 0 and f > f_min:
+           min_index = i
+       if f < f_max:
+           max_index = i
+
+   axis[0].plot(frequencies_cm1[min_index:max_index], molar_absorption[min_index:max_index])
+   axis[0].set_xlabel('Frequency')
+   axis[0].set_ylabel('Molar Abs (L/cm/mol)')
+
+   axis[1].plot(frequencies_cm1[min_index:max_index], np.real(permittivity[0,0,min_index:max_index]), label='xx')
+   axis[1].plot(frequencies_cm1[min_index:max_index], np.real(permittivity[1,1,min_index:max_index]), label='yy')
+   axis[1].plot(frequencies_cm1[min_index:max_index], np.real(permittivity[2,2,min_index:max_index]), label='zz')
+   axis[1].set_xlabel('Frequencies')
+   axis[1].set_ylabel('real permittivity')
+   axis[1].legend()
+
+   axis[2].plot(frequencies_cm1[min_index:max_index], np.imag(permittivity[0,0,min_index:max_index]), label='xx')
+   axis[2].plot(frequencies_cm1[min_index:max_index], np.imag(permittivity[1,1,min_index:max_index]), label='yy')
+   axis[2].plot(frequencies_cm1[min_index:max_index], np.imag(permittivity[2,2,min_index:max_index]), label='zz')
+   axis[2].set_xlabel('Frequencies')
+   axis[2].set_ylabel('imag permittivity')
+   axis[2].legend()
+   plt.show()
+
+def calculate_refractive_index(permittivity, debug=False):
+    ''' Calculate the refractive index from the permittivity array.
+        Calculate the trace of the permittivity and calculate both square roots.
+        The choose the root with the largest imaginary component This obeys the Konig Kramer requirements'''
+    results = []
+    for p in permittivity:
+        solution1 = np.sqrt(p)
+        r, phase = cmath.polar(solution1)
+        solution2 = cmath.rect(-r, phase)
+        imag1 = np.imag(solution1)
+        imag2 = np.imag(solution2)
+        if imag1 > imag2:
+            solution = solution1
+        else:
+            solution = solution2
+        if np.abs(solution*solution-p)/(1+np.abs(p)) > 1.0E-8 or debug:
+            print("There is an error in refractive index")
+            print("Dielectric = ", p)
+            print("solution*solution = ", solution*solution, np.abs(solution*solution-p))
+            print("solution    = ", solution, solution*solution)
+            print("solution1   = ", solution1, solution1*solution1)
+            print("solution2   = ", solution2, solution2*solution2)
+        results.append(solution)
+    return np.array(results)
+
+def calculate_absorption(permittivity, f_cm1):
+    """Calculate the absorption coeffient in cm-1 from the permittivity"""
+    #
+    # First of all find the average permittivity from the trace
+    #
+    average_permittivity = (permittivity[0,0] + permittivity[1,1] + permittivity[2,2]) / 3.0
+    refractive_index = calculate_refractive_index(average_permittivity)
+    #
+    # We are only interested in the imaginary component
+    #
+    absorption = 4.0 *np.pi * f_cm1  * np.imag(refractive_index)
+    return absorption
+
+def fftCorrelationBlock(dipoles, nblocks, blocksize, blockshift):
+    """ Calculate the correlation using an fft """
+    correlations = np.zeros( (3,3,blocksize) )
+    # Begin loop over blocks to calculate the frequency dependent permittivity
+    start = 0
+    for n in range(nblocks):
+        start = n * blockshift
+        # Loop over the indices of the correlation matrix 
+        for i in range(3):
+            for j in range(3):
+                correlations[i,j] += doAnFFtCorrelation(dipoles[i,start:start+blocksize],
+                                                        dipoles[j,start:start+blocksize])
+                #correlations[i,j] += np.correlate(dipoles[i,start:start+blocksize],
+                #                                  dipoles[j,start:start+blocksize],mode='full')[blocksize-1:]
+            # end for j
+        # end for i
+    # end for n
+    return correlations / nblocks
+
+def doAnFFtCorrelation(dipi,dipj):
+    """Calculate the correlation using an FFT"""
+    n = len(dipi)
+    paddedn = 2*find_next_power_of_two(n)
+    datai = np.zeros(paddedn)
+    dataj = np.zeros(paddedn)
+    datai[:n] = dipi 
+    dataj[:n] = dipj 
+    f_datai = np.fft.fft(datai)
+    f_dataj = np.fft.fft(dataj)
+    transform = np.fft.ifft(f_datai.conj()*f_dataj)
+    forwards  = np.real(transform[:n])
+    return forwards
+
+def doANormalisedFFtCorrelation(dipi,dipj):
+    """Calculate the correlation using a normalised FFT"""
+    n = len(dipi)
+    paddedn = 2*find_next_power_of_two(n)
+    datai = np.zeros(paddedn)
+    dataj = np.zeros(paddedn)
+    normij = np.average(dipi*dipj)
+    # Partition the normalisation between the two signals
+    # If the normalisation is negative then this is no longer symmetric
+    if normij > 0.0:
+        datai[:n] = dipi / np.sqrt(normij)
+        dataj[:n] = dipj / np.sqrt(normij)
+    else:
+        datai[:n] = dipi / -np.sqrt(-normij)
+        dataj[:n] = dipj / +np.sqrt(-normij)
+    f_datai = np.fft.fft(datai)
+    f_dataj = np.fft.fft(dataj)
+    transform = np.fft.ifft(f_datai.conj()*f_dataj)
+    forwards  = np.real(transform[:n])
+    return forwards
+
+def calculate_fphi_from_dipole_correlations(correlations):
+    """Calculate fphi using equation A13 of Chen and Li"""
+    i,j,n = np.shape(correlations)
+    fphi = np.zeros( (3,3,n), dtype=complex )
+    for i in range(3):
+        for j in range(3):
+            data1 = correlations[i,j] / correlations[i,j,0]
+            transform = np.fft.fft(data1)
+            fphi[i,j] = 1 -2.0 * np.pi * complex(0,1) * np.arange(n) * transform[:n] / n
+    return fphi
+
+def calculate_fphi_from_dipole_correlation_derivatives(correlations):
+    """Calculate fphi using equation A13 of Chen and Li, but by calculating the time derivative"""
+    i,j,n = np.shape(correlations)
+    fphi = np.zeros( (3,3,n), dtype=complex )
+    for i in range(3):
+        for j in range(3):
+            correlations_dt = -derivatives(correlations[i,j],1.0)
+            data1 = correlations_dt / correlations[i,j,0]
+            transform = np.fft.fft(data1)
+            fphi[i,j] = transform[:n]
+    return fphi
+
+
+#
+# Start main program
+#
+filename             = ''
+this_is_a_test       = False
+lets_plot            = []
+writexlsx            = False
+blocksize            = 0
+blockshift           = 0
+use_windowing        = False
+use_baseline_removal = False
+use_time_derivatives = True
+f_min                = 0                                 # in cm-1
+f_max                = 3500
+average_length       = 0
+windowfunction       = ''
+correlation_length   = 0
+padding_factor       = 4
+exponential          = {}
+optical_permittivity = np.identity( 3 )
+nargs = len(sys.argv)
+if nargs < 2:
+    print_usage()
+    exit()
+else:
+    tokens = sys.argv[1:]
+    ntokens = len(tokens)
+    itoken = 0
+    while itoken < ntokens:
+        token = tokens[itoken]
+        token = token.replace('--','-')
+        if token.startswith('-blocksi'):
+            itoken +=1; blocksize = int(tokens[itoken])
+        elif token.startswith('-blocksh'):
+            itoken +=1; blockshift = int(tokens[itoken])
+        elif token.startswith('-pl'):
+            if itoken < ntokens-1 and not tokens[itoken+1].startswith('-'):
+                itoken += 1; lets_plot.append(tokens[itoken])
+            else:
+                lets_plot.append('permittivity')
+        elif token.startswith('-xl'):
+            writexlsx  = True
+            itoken +=1; xlsxfile = tokens[itoken]
+        elif token.startswith('-test'):
+            this_is_a_test  = True
+        elif token.startswith('-wi'):
+            use_windowing  = True
+            itoken +=1; windowfunction = tokens[itoken]
+            if windowfunction == 'exp':
+                exponential = {}
+                itoken += 1
+                exponential['a'] = int(tokens[itoken])
+                itoken += 1
+                exponential['epsilon'] = float(tokens[itoken])
+        elif token.startswith('-base'):
+            use_baseline_removal  = True
+        elif token.startswith('-pad'):
+            itoken += 1
+            padding_factor  = int(tokens[itoken])
+        elif token.startswith('-corr'):
+            itoken += 1
+            correlation_length  = int(tokens[itoken])
+        elif token.startswith('-notimed'):
+            use_time_derivatives  = False
+        elif token.startswith('-ave'):
+            itoken += 1
+            average_length  = int(tokens[itoken])
+        elif token.startswith('-fmi'):
+            itoken += 1
+            f_min  = float(tokens[itoken])
+        elif token.startswith('-fma'):
+            itoken += 1
+            f_max  = float(tokens[itoken])
+        else:
+            if filename == '':
+                filename  = token
+            else:
+                print('Unkown directive',token,file=sys.stderr)
+                print_usage()
+                exit()
+        itoken += 1
+#end if
+speed_of_light_ms = 299792458
+speed_of_light_cms = speed_of_light_ms * 100.0
+#
+#  Get the dipole trajectory
+#
+if this_is_a_test:
+    dipoles = test_dipoles()
+else:
+    dipoles = read_dipoles()
+#
+i,ntotal = np.shape(dipoles)
+if blocksize < 1 or blocksize > ntotal:
+    use_blocking = False
+    blocksize = ntotal
+else:
+    use_blocking = True
+if blockshift == 0:
+   blockshift = blocksize
+if correlation_length == 0:
+   correlation_length = blocksize
+#
+# Conversion parameters from Wikepedia
+#
+joules2au = 1.0/4.3597447222071E-18 
+angs2au   = 1.0/0.5291772109
+debye2au  = 1.0/2.541746473
+boltzmann = 1.38064852E-23                         # Units Joule/K (m2 kg s-2 K-1)
+beta      = 1.0 / ( boltzmann * temperature )      # Units Joule   (m2 kg s-2)
+#
+# A few useful numbers
+#
+time_step_hz = time_step*1.0E-15
+nyquist_frequency_hz = 1.0/(2*time_step_hz)
+nyquist_frequency_cm1 = nyquist_frequency_hz/speed_of_light_cms 
+frequency_step_hz = 1/(padding_factor*correlation_length * time_step_hz)
+frequency_step_cm1 = frequency_step_hz/speed_of_light_cms
+nblocks = math.floor((ntotal-blocksize)/blockshift + 1.0E-18) + 1
+block_nyquist_frequency_hz = 1.0/(padding_factor*correlation_length*time_step_hz)
+block_nyquist_frequency_cm1 = block_nyquist_frequency_hz/speed_of_light_cms 
+avogadro = 6.0221409e+23
+volume_cm3 = volume * 1.0E-24
+concentration = number_of_molecules / (volume_cm3 / 1000) / avogadro
+#
+# Print out information
+#
+print('File name                      : ',filename)
+print('Time step                      : ',time_step, 'fs')
+print('Nyquist frequency              : ',nyquist_frequency_cm1, 'cm-1')
+print('Frequency step                 : ',frequency_step_cm1, 'cm-1')
+print('Temperature                    : ',temperature, 'K')
+print('Volume of cell                 : ',volume, 'angstrom^3')
+print('Number of molecules / cell     : ',number_of_molecules)
+print('Concentration                  : ',concentration, 'moles/L')
+print('Trajectory length              : ',ntotal)
+print('Minimum frequency              : ',f_min)
+print('Maximum frequency              : ',f_max)
+print('Optical permittivity           : ',optical_permittivity[0,:])
+print('                               : ',optical_permittivity[1,:])
+print('                               : ',optical_permittivity[2,:])
+if use_blocking:
+    print('Using blocking with a blocksize: ',blocksize)
+    print('                     blockshift: ',blockshift)
+else:
+    print('Not using blocking, fft length : ',blocksize)
+print('Correlation length             : ',correlation_length)
+print('Padding factor                 : ',padding_factor)
+print('Block time period              : ',blocksize*time_step, 'fs')
+print('Block shift time period        : ',blockshift*time_step, 'fs')
+print('Block nyquist frequency        : ',block_nyquist_frequency_cm1, 'cm-1')
+print('Number of blocks               : ',nblocks)
+if average_length > 0:
+    print('Perform a moving average       : ',average_length)
+if use_windowing:
+    print('Applying window function       : ',windowfunction)
+    if windowfunction == 'exp':
+        print('Applying window function       : ',windowfunction)
+        print('                              a:',exponential['a'])
+        print('                        epsilon:',exponential['epsilon'])
+else:
+    print('No windowing               : ')
+if writexlsx:
+    print('Writing an xlsx file           : ',xlsxfile)
+    workbook = write_preliminary_xlsx_info()
+#
+# Convert to atomic units
+#
+beta     /= joules2au                           # beta is now in au
+volume   *= angs2au*angs2au*angs2au             # volume is now in au
+eps0      = 1.0 / ( 4 * np.pi )                 # In atomic units 1 au = 4 pi eps0
+dipoles *= debye2au
+#
+# First use the whole trajectory to calculate the static permittivity
+# Mean dipole
+mean_dipoles = np.average(dipoles, axis=1)
+#
+# Compute the deviation of the dipole from the mean
+dipole_deviations = (dipoles.T - mean_dipoles).T
+
+# Calculate the static permittivity. Using the formulae in the paper by Chen and Li (A6 - A10)
+static_permittivity = np.identity(3)
+average_squared_dipoles = np.zeros( (3,3) )
+for i in range(3):
+    for j in range(3):
+        static_permittivity[j,i] += beta / ( eps0 * volume * ntotal)  * np.dot( dipoles[j], dipole_deviations[i] )
+        average_squared_dipoles[j,i]      = np.average( dipole_deviations[j] * dipole_deviations[i] )
+#
+print('Static permittivity')
+print_array(static_permittivity)
+print('Average Dipoles Squared')
+print_array(average_squared_dipoles)
+#
+# Compute the frequency ranges resulting from the ffts
+#
+frequencies_cm1    = frequency_step_cm1 * np.arange(padding_factor*correlation_length)
+times_padded       = time_step          * np.arange(padding_factor*correlation_length)
+times_correlations = time_step          * np.arange(correlation_length)
+times_dipoles      = time_step          * np.arange(ntotal)
+#
+# Compute the correlations of the dipole deviations from the mean
+# Using a blocked correlation function
+#
+full_correlations =  fftCorrelationBlock(dipole_deviations, nblocks, blocksize, blockshift)
+#
+# Now extract only the correlation length from the full correlation
+#
+correlations = full_correlations[:,:,:correlation_length]
+correlation_integral = np.zeros( (3,3) )
+#
+# Create a window function to apply to the correlations
+#
+if use_windowing:
+    window = get_window(windowfunction,correlation_length,exponential)
+    for i in range(3):
+        for j in range(3):
+            correlations[i,j] = window * correlations[i,j]
+#
+# Now pad the correlations with zeros
+# Final result should be padding_factorx the correlation_length
+#
+padded_correlations = np.zeros( (3,3,padding_factor*correlation_length) )
+padded_correlations[:,:,:correlation_length] = correlations[:,:,:]
+correlation_integral = padded_correlations[:,:,0]
+#
+print('Integral of correlation function')
+print_array(correlation_integral)
+#
+# Calculate equation A13 in J Appl Phys 129 244104 (2021)
+#
+L                = np.zeros( (3,3,padding_factor*correlation_length), dtype=complex )
+permittivity     = np.zeros( (3,3,padding_factor*correlation_length), dtype=complex)
+# Include the optical permittivity here
+unity            = np.identity( 3 ) + optical_permittivity
+#
+if use_time_derivatives:
+    fphi  = calculate_fphi_from_dipole_correlation_derivatives(padded_correlations)
+else:
+    fphi = calculate_fphi_from_dipole_correlations(padded_correlations)
+#
+# Assemble all the terms and calculate the permittivity
+# We need to consider the total permittivity include the optical permittivity
+#
+for i in range(3):
+    for j in range(3):
+        unityij = np.full( padding_factor*correlation_length, unity[i,j] )
+        L[i,j] = average_squared_dipoles[i,j] * fphi[i,j]
+        permittivity[i,j] = beta / ( volume * eps0 ) * L[i,j] + unityij
+#
+# Perform a moving average on the permittivity
+#
+if average_length > 0:
+    for i in range(3):
+        for j in range(3):
+            permittivity[i,j] = uniform_filter1d(permittivity[i,j],size=average_length,mode='nearest')
+#
+# Calculate absorption
+#
+absorption = calculate_absorption(permittivity,frequencies_cm1)            # cm-1
+molar_absorption = absorption / concentration                              # L /mol/cm
+#
+# Apply baseline removal
+#
+if use_baseline_removal:
+    lambda_value = -7.0
+    iterations = 10
+    damping = 0.01
+    absorption = hodrick_prescott_filter( absorption, damping, lambda_value, iterations)
+    molar_absorption = absorption / concentration                              # L /mol/cm
+#
+# Print and plot the results
+#
+if writexlsx:
+    worksheet = workbook.add_worksheet('correlations')
+    write_correlations(worksheet, padded_correlations, times_padded)
+    worksheet = workbook.add_worksheet('absorptions')
+    write_absorption(worksheet, molar_absorption, absorption, permittivity, frequencies_cm1)
+    workbook.close()
+
+for plot in lets_plot:
+    plot_correlations(dipoles,times_dipoles, padded_correlations, times_padded)
+    plot_permittivity(molar_absorption, absorption, permittivity, frequencies_cm1)
+
