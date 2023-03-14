@@ -761,6 +761,8 @@ if writexlsx:
     workbook.close()
 
 for plot in lets_plot:
-    plot_correlations(dipoles,times_dipoles, padded_correlations, times_padded)
-    plot_permittivity(molar_absorption, absorption, permittivity, frequencies_cm1)
+    if plot.startswith('corr') or plot.startswith('dip'):
+        plot_correlations(dipoles,times_dipoles, padded_correlations, times_padded)
+    if plot.startswith('perm') or plot.startswith('abs'):
+        plot_permittivity(molar_absorption, absorption, permittivity, frequencies_cm1)
 
