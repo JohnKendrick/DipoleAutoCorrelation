@@ -1,9 +1,10 @@
+# Calculating the dipole correlation functions from MD
 The python module dipole_acf reads a file of dipole moment fluctuations for a periodic cell calculated using molecular dynamics.   The source code for the module can be found in the Source/ directory
 
-# The CP2K MD calculation
+## The CP2K MD calculation
 The Example/ directory has an example file of dipole moments calculated by the CP2K package.  The input for the CP2K calculation can be found in the Example/CP2K directory.  The MD calculation generates a file of cell dipole moments which are stored in Example/CP2K/dipolemoments.traj.  
 
-## Generating an input file
+### Generating an input file
 From the dipolemoments.traj file the cell dipole moments in atomic units are extracted using a grep command;
 
     grep ' X=' dipolemoments.traj > dipoles.traj
@@ -27,7 +28,7 @@ For the example provided the beginning of the dipoles.traj file looks like this;
 
 ## Examples running the script
 
-Run the following code in the example directory; 
+Run the following code in the example/ directory; 
 
     ../source/dipole_acf dipoles.traj -plot
 
