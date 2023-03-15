@@ -1,4 +1,4 @@
-# Calculating the dipole correlation functions from MD
+# Calculating the dipole correlation function
 The python module dipole_acf reads a file of dipole moment fluctuations for a periodic cell calculated using molecular dynamics.   The source code for the module can be found in the Source/ directory
 
 ## The CP2K MD calculation
